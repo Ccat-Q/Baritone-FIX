@@ -81,7 +81,6 @@ allprojects {
         compileOnly "org.spongepowered:mixin:${project.mixin_version}"
         compileOnly "org.ow2.asm:asm:${project.asm_version}"
 
-        implementation "dev.babbaj:nether-pathfinder:${project.nether_pathfinder_version}"
         implementation 'org.tukaani:xz:1.9'
 
         implementation 'com.google.code.findbugs:jsr305:3.0.2'

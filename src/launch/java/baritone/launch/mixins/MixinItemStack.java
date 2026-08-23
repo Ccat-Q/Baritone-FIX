@@ -18,6 +18,7 @@
 package baritone.launch.mixins;
 
 import baritone.api.utils.accessor.IItemStack;
+import baritone.launch.guard.RecalcGuard;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import org.spongepowered.asm.mixin.Final;
@@ -50,7 +51,15 @@ public abstract class MixinItemStack implements IItemStack {
             at = @At("RETURN")
     )
     private void onInit(CallbackInfo ci) {
-        recalculateHash();
+        if (RecalcGuard.RECALC_IN_PROGRESS.get()) {
+            return;
+        }
+        RecalcGuard.RECALC_IN_PROGRESS.set(true);
+        try {
+            recalculateHash();
+        } finally {
+            RecalcGuard.RECALC_IN_PROGRESS.set(false);
+        }
     }
 
     @Inject(
