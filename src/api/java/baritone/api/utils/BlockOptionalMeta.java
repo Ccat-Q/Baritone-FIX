@@ -64,6 +64,7 @@ import java.lang.reflect.Field;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -203,19 +204,29 @@ public final class BlockOptionalMeta {
     }
 
     private static synchronized List<Item> drops(Block b) {
-        List<Item> cached = drops.get(b);
+        // Failed computations (null from computeDrops, e.g. no live Level registry
+        // access) are not cached, so a later #mine invocation can retry.
+        return cacheOrCompute(drops, b, BlockOptionalMeta::computeDrops, Collections.emptyList());
+    }
+
+    /**
+     * Returns the cached value for {@code key}, or computes and caches it when
+     * absent. A {@code null} computation result is treated as a failure: the
+     * {@code failureFallback} is returned without caching, so a later call can
+     * retry. A non-null result is cached before being returned. This is the
+     * plain-JVM-testable seam for the {@code drops} cache policy.
+     */
+    static <K, V> V cacheOrCompute(Map<K, V> cache, K key, Function<K, V> compute, V failureFallback) {
+        V cached = cache.get(key);
         if (cached != null) {
             return cached;
         }
-        List<Item> items = computeDrops(b);
-        if (items == null) {
-            // The lookup failed (no live Level registry access and the lazy reload
-            // is unavailable). Do NOT cache the empty result: a later #mine
-            // invocation must be able to retry once registry access exists.
-            return Collections.emptyList();
+        V value = compute.apply(key);
+        if (value == null) {
+            return failureFallback;
         }
-        drops.put(b, items);
-        return items;
+        cache.put(key, value);
+        return value;
     }
 
     /**
