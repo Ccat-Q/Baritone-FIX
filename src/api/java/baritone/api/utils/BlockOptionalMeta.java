@@ -28,7 +28,6 @@ import net.minecraft.core.LayeredRegistryAccess;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.resources.RegistryDataLoader;
 import net.minecraft.resources.ResourceKey;
-import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.RegistryLayer;
 import net.minecraft.server.ReloadableServerRegistries;
@@ -204,26 +203,50 @@ public final class BlockOptionalMeta {
     }
 
     private static synchronized List<Item> drops(Block b) {
-        return drops.computeIfAbsent(b, block -> {
-            ResourceLocation lootTableLocation = block.getLootTable().location();
-            if (lootTableLocation.equals(BuiltInLootTables.EMPTY.location())) {
-                return Collections.emptyList();
-            } else {
-                List<Item> items = new ArrayList<>();
-                try {
-                    ServerLevel lv2 = ServerLevelStub.fastCreate();
+        List<Item> cached = drops.get(b);
+        if (cached != null) {
+            return cached;
+        }
+        List<Item> items = computeDrops(b);
+        if (items == null) {
+            // The lookup failed (no live Level registry access and the lazy reload
+            // is unavailable). Do NOT cache the empty result: a later #mine
+            // invocation must be able to retry once registry access exists.
+            return Collections.emptyList();
+        }
+        drops.put(b, items);
+        return items;
+    }
 
-                    LootParams.Builder lv5 = new LootParams.Builder(lv2)
-                        .withParameter(LootContextParams.ORIGIN, Vec3.ZERO)
-                        .withParameter(LootContextParams.BLOCK_STATE, b.defaultBlockState())
-                        .withParameter(LootContextParams.TOOL, new ItemStack(Items.NETHERITE_PICKAXE, 1));
-                    getDrops(block, lv5).stream().map(ItemStack::getItem).forEach(items::add);
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
+    /**
+     * Computes the drop items for a block, or returns {@code null} when the
+     * registry access needed to evaluate the loot table is unavailable. A
+     * {@code null} result is a failure signal: the caller must not cache it.
+     */
+    private static List<Item> computeDrops(Block b) {
+        List<Item> items = new ArrayList<>();
+        try {
+            ResourceKey<LootTable> lootTable = b.getLootTable();
+            if (lootTable == null) {
+                // No loot table at all: drops cannot be determined, treat as
+                // unavailable so the lookup is retried later rather than cached.
+                return null;
+            }
+            if (lootTable.equals(BuiltInLootTables.EMPTY)) {
                 return items;
             }
-        });
+            ServerLevel lv2 = ServerLevelStub.fastCreate();
+
+            LootParams.Builder lv5 = new LootParams.Builder(lv2)
+                .withParameter(LootContextParams.ORIGIN, Vec3.ZERO)
+                .withParameter(LootContextParams.BLOCK_STATE, b.defaultBlockState())
+                .withParameter(LootContextParams.TOOL, new ItemStack(Items.NETHERITE_PICKAXE, 1));
+            getDrops(b, lv5).stream().map(ItemStack::getItem).forEach(items::add);
+        } catch (Exception e) {
+            e.printStackTrace();
+            return null;
+        }
+        return items;
     }
 
     private static List<ItemStack> getDrops(Block state, LootParams.Builder params) {
@@ -239,9 +262,20 @@ public final class BlockOptionalMeta {
     }
 
     public static class ServerLevelStub extends ServerLevel {
-        private static Minecraft client = Minecraft.getInstance();
-        private static Unsafe unsafe = getUnsafe();
-        private static CompletableFuture<RegistryAccess> registryAccess = load();
+
+        private static final Unsafe unsafe = getUnsafe();
+
+        /**
+         * The registry access is deliberately NOT loaded during class initialization.
+         * A registry reload (RegistryDataLoader) failing inside {@code <clinit>} would
+         * permanently poison the class with {@link ExceptionInInitializerError} and
+         * later {@link NoClassDefFoundError} -- observed with {@code #mine} under
+         * NeoForge/Sinytra Connector when loading the empty painting_variant and
+         * wolf_variant registries. It is instead resolved lazily on first use,
+         * preferring the live client/server registry access and only reloading as a
+         * non-fatal fallback.
+         */
+        private static volatile CompletableFuture<RegistryAccess> registryAccess;
 
         public ServerLevelStub(MinecraftServer $$0, Executor $$1, LevelStorageSource.LevelStorageAccess $$2, ServerLevelData $$3, ResourceKey<Level> $$4, LevelStem $$5, ChunkProgressListener $$6, boolean $$7, long $$8, List<CustomSpawner> $$9, boolean $$10, @Nullable RandomSequences $$11) {
             super($$0, $$1, $$2, $$3, $$4, $$5, $$6, $$7, $$8, $$9, $$10, $$11);
@@ -249,8 +283,9 @@ public final class BlockOptionalMeta {
 
         @Override
         public FeatureFlagSet enabledFeatures() {
-            assert client.level != null;
-            return client.level.enabledFeatures();
+            Level level = Minecraft.getInstance().level;
+            assert level != null;
+            return level.enabledFeatures();
         }
 
         public static ServerLevelStub fastCreate() {
@@ -263,7 +298,30 @@ public final class BlockOptionalMeta {
 
         @Override
         public RegistryAccess registryAccess() {
-            return registryAccess.join();
+            // Prefer the live client/server registry access when one is available: it
+            // is already fully populated by the game (including mod datapack
+            // registries), so no registry reload is needed and none can fail here.
+            Level level = Minecraft.getInstance().level;
+            if (level != null) {
+                RegistryAccess live = level.registryAccess();
+                if (live != null) {
+                    return live;
+                }
+            }
+            // No live registry access: reload lazily (never during class
+            // initialization). A failure is non-fatal -- the caller in
+            // BlockOptionalMeta.drops() degrades to an empty drop list.
+            CompletableFuture<RegistryAccess> future = registryAccess;
+            if (future == null) {
+                synchronized (ServerLevelStub.class) {
+                    future = registryAccess;
+                    if (future == null) {
+                        future = load();
+                        registryAccess = future;
+                    }
+                }
+            }
+            return future.join();
         }
 
         public ReloadableServerRegistries.Holder holder() {
